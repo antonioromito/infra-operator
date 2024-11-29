@@ -75,6 +75,7 @@ WORKERS = int(config["WORKERS"]) if 'WORKERS' in config else 4
 SMART_EVACUATION = config["SMART_EVACUATION"] if 'SMART_EVACUATION' in config else "false"
 RESERVED_HOSTS = config["RESERVED_HOSTS"] if 'RESERVED_HOSTS' in config else "false"
 LEAVE_DISABLED = config["LEAVE_DISABLED"] if 'LEAVE_DISABLED' in config else "false"
+FORCE_ENABLE = config["FORCE_ENABLE"] if 'FORCE_ENABLE' in config else "false"
 CHECK_KDUMP = config["CHECK_KDUMP"] if 'CHECK_KDUMP' in config else "false"
 LOGLEVEL = config["LOGLEVEL"].upper() if 'LOGLEVEL' in config else "INFO"
 DISABLED = config["DISABLED"] if 'DISABLED' in config else "false"
@@ -156,7 +157,8 @@ def _custom_check():
     return result
 
 
-def _host_evacuate(connection, host):
+def _host_evacuate(connection, service):
+    host = service.host
     result = True
     if 'true' in TAGGED_IMAGES:
         images = _get_evacuable_images(connection)
@@ -170,14 +172,15 @@ def _host_evacuate(connection, host):
     servers = [server for server in servers if server.status in {'ACTIVE', 'ERROR', 'STOPPED'}]
 
     if flavors or images:
-        logging.debug("Filtering images and flavors: %s %s" % (repr(flavors), repr(images)))
+        logging.info("Filtering images and flavors: %s %s" % (repr(flavors), repr(images)))
         # Identify all evacuable servers
-        logging.debug("Checking %s" % repr(servers))
+        logging.info("Checking %s" % repr(servers))
         evacuables = [server for server in servers if _is_server_evacuable(server, flavors, images)]
-        logging.debug("Evacuating %s" % repr(evacuables))
+        logging.info("Evacuating %s" % repr(evacuables))
     else:
-        logging.debug("Evacuating all images and flavors")
+        logging.info("Evacuating all images and flavors")
         evacuables = servers
+        logging.info("Evacuating %s" % repr(evacuables))
 
     if evacuables == []:
         logging.info("Nothing to evacuate")
@@ -188,8 +191,9 @@ def _host_evacuate(connection, host):
 
     # if SMART_EVACUATION is 'True' (string) use a ThreadPoolExecutor to poll the evacuation status
     # otherwise use the old "fire and forget" approach
-    if 'true' in SMART_EVACUATION.lower():
 
+    if 'true' in SMART_EVACUATION.lower():
+        logging.info("SMART_EVACUATION variable is set to true")
         # at this point we have a list of servers to evacuate called 'evacuables'
         # we spawn X (4) threads to evacuate X vms in parallel and follow the evacuation
 
@@ -202,20 +206,29 @@ def _host_evacuate(connection, host):
                     data = future.result()
                     if data is False:
                         logging.debug('Evacuation of %s failed 5 times in a row' % server.id)
+                        # update DISABLED reason so we don't try to evacuate again and give evidence of what happened
+                        try:
+                            connection.services.disable_log_reason(service.id, "evacuation FAILED: %s" % datetime.now().isoformat())
+                            logging.info('Evacuation failed. Updated disabled reason for host %s', host)
+                        except Exception as e:
+                            logging.error('Failed to update disable_reason for host %s. Error: %s', host, e)
+                            logging.debug('Exception traceback:', exc_info=True)
                         return data
                 except Exception as exc:
                     logging.error('Evacuation generated an exception: %s' % exc)
+                    return False
                 else:
                     logging.info('%r evacuated successfully' % server.id)
         #return result
 
-    else:
+    elif 'false' in SMART_EVACUATION.lower():
+        logging.info("SMART_EVACUATION variable is set to false")
         for server in evacuables:
-            logging.debug("Processing %s" % server)
+            logging.info("Processing evacuation of instance %s" % server)
             if hasattr(server, 'id'):
                 response = _server_evacuate(connection, server.id)
                 if response["accepted"]:
-                    logging.debug("Evacuated %s from %s: %s" % (response["uuid"], host, response["reason"]))
+                    logging.info("Evacuated %s from %s: %s" % (response["uuid"], host, response["reason"]))
                 else:
                     logging.warning("Evacuation of %s on %s failed: %s" % (response["uuid"], host, response["reason"]))
                     result = False
@@ -230,7 +243,7 @@ def _host_evacuate(connection, host):
 
 def _server_evacuate(connection, server):
     try:
-        logging.debug("Resurrecting instance: %s" % server)
+        logging.info("Resurrecting instance: %s" % server)
         response, dictionary = connection.servers.evacuate(server=server)
         if response is None:
             error_message = "No response received while evacuating instance"
@@ -264,7 +277,7 @@ def _server_evacuation_status(connection, server):
         # use this info to poll the evacuation status.
         # nova api v2.59 lists them in reverse time order (last first) so we need to check the first item "[0]"
 
-        logging.debug("Polling evacuation of instance: %s" % server)
+        logging.info("Polling evacuation of instance: %s" % server)
         #FIXME: this not really lasthour, more last5minutes
         lasthour = (datetime.now() - timedelta(minutes=5)).isoformat()
 
@@ -291,7 +304,7 @@ def _server_evacuation_status(connection, server):
                 "error": error_msg,
             }
 
-        logging.debug("%s evacuation status: %s" % (server, status))
+        logging.info("%s evacuation status: %s" % (server, status))
 
         if status in ['completed', 'done']:
             completed = True
@@ -315,10 +328,7 @@ def _server_evacuation_status(connection, server):
 
 def _server_evacuate_future(connection, server):
 
-    try:
-        error_count
-    except:
-        error_count = 0
+    error_count = 0
 
     logging.info("Processing %s" % server.id)
     if hasattr(server, 'id'):
@@ -326,7 +336,7 @@ def _server_evacuate_future(connection, server):
         response = _server_evacuate(connection, server.id)
 
         if response["accepted"]:
-            logging.debug("Starting evacuation of %s" % response["uuid"])
+            logging.info("Starting evacuation of %s" % response["uuid"])
 
             time.sleep(10)
 
@@ -352,7 +362,7 @@ def _server_evacuate_future(connection, server):
                     time.sleep(5)
                     continue
                 #evacuation not finished, poll again.
-                logging.debug("Evacuation of %s still in progress" % response["uuid"])
+                logging.info("Evacuation of %s still in progress" % response["uuid"])
                 time.sleep(5)
                 continue
         else:
@@ -736,7 +746,7 @@ def process_service(service, reserved_hosts, resume):
 
     try:
         logging.info('Start evacuation of %s' % service.host)
-        evacuation_result = _host_evacuate(conn, service.host)
+        evacuation_result = _host_evacuate(conn, service)
     except Exception as e:
         logging.error('Failed to evacuate %s: %s' % (service.host, e))
         logging.debug('Exception traceback:', exc_info=True)
@@ -808,91 +818,97 @@ def main():
 
         previous_hash = current_hash
 
-        services = conn.services.list(binary="nova-compute")
+        try:
+            services = conn.services.list(binary="nova-compute")
 
-        # How fast do we want to react / how much do we want to wait before considering a host worth of our attention
-        # We take the current time and subtract a DELTA amount of seconds to have a point in time threshold
-        target_date = datetime.now() - timedelta(seconds=DELTA)
+            # How fast do we want to react / how much do we want to wait before considering a host worth of our attention
+            # We take the current time and subtract a DELTA amount of seconds to have a point in time threshold
+            target_date = datetime.now() - timedelta(seconds=DELTA)
 
-        # We check if a host is still up but has not been reporting its state for the last DELTA seconds or if it is down.
-        # We filter previously disabled hosts or the ones that are forced_down.
-        compute_nodes = [service for service in services if (datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down') and 'disabled' not in service.status and not service.forced_down]
+            # We check if a host is still up but has not been reporting its state for the last DELTA seconds or if it is down.
+            # We filter previously disabled hosts or the ones that are forced_down.
+            compute_nodes = [service for service in services if (datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down') and 'disabled' not in service.status and not service.forced_down]
 
-        # Let's check if there are computes nodes that were already being processed, we want to check them again in case the pod was restarted
-        to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason]
+            # Let's check if there are computes nodes that were already being processed, we want to check them again in case the pod was restarted
+            to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason and 'evacuation FAILED' not in service.disabled_reason]
 
+            if not (compute_nodes + to_resume) == []:
+                logging.warning('The following computes are down:' + str([service.host for service in compute_nodes]))
 
-        if not (compute_nodes + to_resume) == []:
-            logging.warning('The following computes are down:' + str([service.host for service in compute_nodes]))
+                # Filter out computes that have no vms running (we don't want to waste time evacuating those anyway)
+                compute_nodes = [service for service in compute_nodes if service not in [c for c in compute_nodes if not conn.servers.list(search_opts={'host': c.host, 'all_tenants': 1})]]
 
-            # Filter out computes that have no vms running (we don't want to waste time evacuating those anyway)
-            compute_nodes = [service for service in compute_nodes if service not in [c for c in compute_nodes if not conn.servers.list(search_opts={'host': c.host, 'all_tenants': 1})]]
+                # Check if there are images, flavors or aggregates configured with the EVACUABLE tag
+                images = _get_evacuable_images(conn)
+                flavors = _get_evacuable_flavors(conn)
+                evacuable_aggregates = [i for i in conn.aggregates.list() if EVACUABLE_TAG in i.metadata]
 
-            # Check if there are images, flavors or aggregates configured with the EVACUABLE tag
-            images = _get_evacuable_images(conn)
-            flavors = _get_evacuable_flavors(conn)
-            evacuable_aggregates = [i for i in conn.aggregates.list() if EVACUABLE_TAG in i.metadata]
+                if flavors or images:
+                    compute_nodes = [s for s in compute_nodes if [v for v in conn.servers.list(search_opts={'host': s.host, 'all_tenants': 1 }) if _is_server_evacuable(v, flavors, images)]]
 
-            if flavors or images:
-                compute_nodes = [s for s in compute_nodes if [v for v in conn.servers.list(search_opts={'host': s.host, 'all_tenants': 1 }) if _is_server_evacuable(v, flavors, images)]]
+                if evacuable_aggregates:
+                    # Filter out computes not part of evacuable aggregates (if any aggregate is tagged, otherwise evacuate them all)
+                    compute_nodes = [service for service in compute_nodes if _is_aggregate_evacuable(conn, service.host)]
 
-            if evacuable_aggregates:
-                # Filter out computes not part of evacuable aggregates (if any aggregate is tagged, otherwise evacuate them all)
-                compute_nodes = [service for service in compute_nodes if _is_aggregate_evacuable(conn, service.host)]
+                logging.info('List of stale services is %s' % [service.host for service in compute_nodes])
 
-            logging.debug('List of stale services is %s' % [service.host for service in compute_nodes])
-
-            # Get list of reserved hosts (if feature is enabled)
-            if 'true' in RESERVED_HOSTS.lower():
-                reserved_hosts = [service for service in services if ('disabled' in service.status and 'reserved' in service.disabled_reason )]
-            else:
-                reserved_hosts = []
-
-            if compute_nodes or to_resume:
-                if (len(compute_nodes) / len(services) * 100) > THRESHOLD:
-                    logging.error('Number of impacted computes exceeds the defined threshold. There is something wrong.')
-                    pass
+                # Get list of reserved hosts (if feature is enabled)
+                if 'true' in RESERVED_HOSTS.lower():
+                    reserved_hosts = [service for service in services if ('disabled' in service.status and 'reserved' in service.disabled_reason )]
                 else:
-                    if 'true' in CHECK_KDUMP.lower():
-                        # Check if some of these computes are crashed and currently kdumping
-                        to_evacuate = _check_kdump(compute_nodes)
+                    reserved_hosts = []
+
+                if compute_nodes or to_resume:
+                    if (len(compute_nodes) / len(services) * 100) > THRESHOLD:
+                        logging.error('Number of impacted computes exceeds the defined threshold. There is something wrong.')
+                        pass
                     else:
-                        to_evacuate = compute_nodes
+                        if 'true' in CHECK_KDUMP.lower():
+                            # Check if some of these computes are crashed and currently kdumping
+                            to_evacuate = _check_kdump(compute_nodes)
+                        else:
+                            to_evacuate = compute_nodes
 
-                    if 'false' in DISABLED.lower():
-                        # process computes that are seen as down for the first time
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
-                        if not all(results):
-                            logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
-                        # process computes that were half-evacuated
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
-                        if not all(results):
-                            logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
+                        if 'false' in DISABLED.lower():
+                            # process computes that are seen as down for the first time
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
+                            if not all(results):
+                                logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
+                            # process computes that were half-evacuated
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
+                            if not all(results):
+                                logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
 
+                        else:
+                            logging.info('InstanceHa DISABLE is true, not evacuating')
+
+
+            # We need to wait until a compute is back and for the migrations to move from 'done' to 'completed' before we can force_down=false
+
+            to_reenable = [service for service in services if 'enabled' in service.status and service.forced_down]
+            if to_reenable:
+                logging.info('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
+
+                # list all the migrations having each compute as source, if they are all completed (or failed) go ahead and re-enable it
+                for i in to_reenable:
+                    migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
+                    # users can bypass the safety net by setting FORCE_ENABLE=true
+                    incomplete = [a.id for a in migr if 'completed' not in a.status and 'error' not in a.status] if 'false' in FORCE_ENABLE else []
+
+                    if incomplete == []:
+                        logging.info('All migrations completed, reenabling %s' % i.host)
+                        try:
+                            _host_enable(conn, i, reenable=True)
+                        except Exception as e:
+                            logging.error('Failed to enable %s: %s' % (service.host, e))
+                            logging.debug('Exception traceback:', exc_info=True)
                     else:
-                        logging.info('InstanceHa DISABLE is true, not evacuating')
+                        logging.warning('At least one migration not completed %s, not reenabling %s' % (incomplete, i.host) )
 
-        # We need to wait until a compute is back and for the migrations to move from 'done' to 'completed' before we can force_down=false
-
-        to_reenable = [service for service in services if 'enabled' in service.status and service.forced_down]
-        if to_reenable:
-            logging.debug('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
-
-            # list all the migrations having each compute as source, if they are all completed go ahead and re-enable it
-            for i in to_reenable:
-                migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
-                incomplete = [a.id for a in migr if 'completed' not in a.status]
-                if incomplete == []:
-                    logging.debug('All migrations completed, reenabling %s' % i.host)
-                    try:
-                        _host_enable(conn, i, reenable=True)
-                    except Exception as e:
-                        logging.error('Failed to enable %s: %s' % (service.host, e))
-                        logging.debug('Exception traceback:', exc_info=True)
-                else:
-                    logging.debug('At least one migration not completed %s, not reenabling %s' % (incomplete, i.host) )
+        except Exception as e:
+            logging.warning("Failed to query compute status. Please check the Nova Api availability.")
 
         time.sleep(POLL)
 
