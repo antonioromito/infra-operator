@@ -28,6 +28,8 @@ from keystoneauth1 import session as ksc_session
 from keystoneauth1.exceptions.discovery import DiscoveryFailure
 from keystoneauth1.exceptions.http import Unauthorized
 
+VERSION = '1.0.8'
+
 TRUE_TAGS = 'true'
 
 UDP_IP = ''
@@ -35,6 +37,9 @@ UDP_PORT =  os.getenv('UDP_PORT', 7410)
 
 current_hash = ""
 hash_update_successful = True
+
+FAILED_EVACUATIONS = set()
+FAILED_HOSTS = set()
 
 class HealthCheckServer(server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -156,7 +161,10 @@ def _custom_check():
     return result
 
 
-def _host_evacuate(connection, host):
+def _host_evacuate(connection, service):
+    global FAILED_EVACUATIONS
+    host = service.host
+
     result = True
     if 'true' in TAGGED_IMAGES:
         images = _get_evacuable_images(connection)
@@ -168,6 +176,9 @@ def _host_evacuate(connection, host):
         flavors = []
     servers = connection.servers.list(search_opts={'host': host, 'all_tenants': 1 })
     servers = [server for server in servers if server.status in {'ACTIVE', 'ERROR', 'STOPPED'}]
+
+    # Filter out instances that have previously failed evacuation
+    servers = [server for server in servers if server.id not in FAILED_EVACUATIONS]
 
     if flavors or images:
         logging.debug("Filtering images and flavors: %s %s" % (repr(flavors), repr(images)))
@@ -201,10 +212,18 @@ def _host_evacuate(connection, host):
                 try:
                     data = future.result()
                     if data is False:
-                        logging.debug('Evacuation of %s failed 5 times in a row' % server.id)
+                        logging.error('Evacuation of %s failed 5 times in a row' % server.id)
+                        # update DISABLED reason so we don't try to evacuate again and give evidence of what happened
+                        try:
+                            connection.services.disable_log_reason(service.id, "evacuation FAILED: %s" % datetime.now().isoformat())
+                            logging.info('Evacuation failed. Updated disabled reason for host %s', host)
+                        except Exception as e:
+                            logging.error('Failed to update disable_reason for host %s. Error: %s', host, e)
+                            logging.debug('Exception traceback:', exc_info=True)
                         return data
                 except Exception as exc:
                     logging.error('Evacuation generated an exception: %s' % exc)
+                    return False
                 else:
                     logging.info('%r evacuated successfully' % server.id)
         #return result
@@ -229,14 +248,15 @@ def _host_evacuate(connection, host):
 
 
 def _server_evacuate(connection, server):
+    success = False
     try:
-        logging.debug("Resurrecting instance: %s" % server)
+        logging.info("Trying to resurrect instance: %s" % server)
         response, dictionary = connection.servers.evacuate(server=server)
-        if response is None:
-            error_message = "No response received while evacuating instance"
-        elif response.status_code == 200:
+        if response.status_code == 200:
             success = True
             error_message = response.reason
+        elif response is None:
+            error_message = "No response received while evacuating instance"
         else:
             error_message = response.reason
     except NotFound:
@@ -273,6 +293,7 @@ def _server_evacuation_status(connection, server):
                                                         migration_type='evacuation',
                                                         changes_since=lasthour,
                                                         limit='100000')[0]
+
         except IndexError:
             logging.error("No evacuations found for instance: %s" % server)
             error_msg = True
@@ -283,6 +304,7 @@ def _server_evacuation_status(connection, server):
 
         try:
             status = last_migration._info['status']
+            #logging.info("Last migration status for %s instance: %s" (server, last_migration._info['status']))
         except (AttributeError, KeyError):
             logging.error("Failed to get evacuation status for instance: %s" % server)
             error_msg = True
@@ -294,12 +316,19 @@ def _server_evacuation_status(connection, server):
         logging.debug("%s evacuation status: %s" % (server, status))
 
         if status in ['completed', 'done']:
+            logging.info("Evacuation of instance %s finished with status '%s'" % (server, status))
             completed = True
             error_msg = False
         elif status == 'migrating':
+            logging.info("Evacuation of instance %s is still in progress with status '%s'" % (server, status))
             completed = False
             error_msg = False
         elif status == 'error':
+            logging.error("Evacuation of instance %s failed with status '%s'" % (server, status))
+            completed = False
+            error_msg = True
+        else:
+            logging.error("Evacuation of instance %s failed with status '%s'" % (server, status))
             completed = False
             error_msg = True
 
@@ -314,11 +343,9 @@ def _server_evacuation_status(connection, server):
 
 
 def _server_evacuate_future(connection, server):
-
-    try:
-        error_count
-    except:
-        error_count = 0
+    global FAILED_EVACUATIONS
+    result = False
+    error_count = 0
 
     logging.info("Processing %s" % server.id)
     if hasattr(server, 'id'):
@@ -336,18 +363,18 @@ def _server_evacuate_future(connection, server):
 
                 if status["completed"]:
                     logging.info("Evacuation of %s completed" % response["uuid"])
+                    # Remove from FAILED_EVACUATIONS if present
+                    FAILED_EVACUATIONS.discard(server.id)
                     result = True
                     break
                 if status["error"]:
-                    if error_count == 5:
-                        logging.error("Failed evacuating %s 5 times. Giving up." % response["uuid"])
+                    error_count += 1
+                    if error_count >= 5:
+                        logging.error("Failed evacuating %s instance 5 times. Giving up." % response["uuid"])
+                        # Add to FAILED_EVACUATIONS
+                        FAILED_EVACUATIONS.add(server.id)
                         result = False
                         break
-                    try:
-                        error_count
-                    except:
-                        error_count = 0
-                    error_count += 1
                     logging.warning("Evacuation of instance %s failed %s times. Trying again." % (response["uuid"], error_count))
                     time.sleep(5)
                     continue
@@ -358,11 +385,12 @@ def _server_evacuate_future(connection, server):
         else:
             logging.warning("Evacuation of %s on %s failed: %s" %
                             (response["uuid"], server.id, response["reason"]))
+            FAILED_EVACUATIONS.add(server.id)
             result = False
     else:
         logging.warning("Could not evacuate instance: %s" % server.to_dict())
         # Should a malformed instance result in a failed evacuation?
-        # result = False
+        result = False
     return result
 
 
@@ -499,26 +527,53 @@ def _host_enable(connection, service, reenable=False):
         try:
             logging.info('Unsetting force-down on host %s after evacuation', service.host)
             connection.services.force_down(service.id, False)
-            logging.info('Successfully unset force-down on host %s', service.host)
-        except:
-            logging.error('Could not unset force-down for %s. Please check the host status and perform manual cleanup if necessary', service.host)
-            return False
 
-    else:
-        for _ in range(3):
-            try:
-                logging.info('Trying to enable %s', service.host)
-                connection.services.enable(service.id)
-                logging.info('Host %s is now enabled', service.host)
-            except Exception as e:
-                err = e
-                continue
+            retries = 5
+            delay = 5
+            for attempt in range(retries):
+                time.sleep(delay)
+                updated_services = connection.services.list(host=service.host)
+                if not updated_services:
+                    logging.error('Service %s on host %s not found during verification', service.binary, service.host)
+                    return False
+                updated_service = updated_services[0]
+                if not updated_service.forced_down:
+                    logging.info('Successfully unset force-down on host %s', service.host)
+                    break
+                else:
+                    logging.warning('Host %s still has forced_down=True after attempt %d', service.host, attempt + 1)
             else:
-                break
-        else:
-            raise err
+                logging.error('Failed to unset force-down on host %s after %d attempts', service.host, retries)
+                return False
+        except Exception as e:
+            logging.error('Could not unset force-down for %s. Please check the host status and perform manual cleanup if necessary. Error: %s', service.host, e)
+            logging.debug('Exception traceback:', exc_info=True)
             return False
-
+    else:
+        retries = 5
+        delay = 5
+        for attempt in range(retries):
+            try:
+                logging.info('Trying to enable %s (Attempt %d)', service.host, attempt + 1)
+                connection.services.enable(service.id)
+                time.sleep(delay)
+                updated_services = connection.services.list(host=service.host)
+                if not updated_services:
+                    logging.error('Service %s on host %s not found during verification', service.binary, service.host)
+                    continue
+                updated_service = updated_services[0]
+                if 'enabled' in updated_service.status:
+                    logging.info('Host %s is now enabled', service.host)
+                    break
+                else:
+                    logging.warning('Host %s is still disabled after attempt %d', service.host, attempt + 1)
+            except Exception as e:
+                logging.error('Error enabling host %s on attempt %d: %s', service.host, attempt + 1, e)
+                logging.debug('Exception traceback:', exc_info=True)
+                continue
+        else:
+            logging.error('Failed to enable host %s after %d attempts', service.host, retries)
+            return False
     return True
 
 
@@ -678,6 +733,7 @@ def _host_fence(host, action):
 
 
 def process_service(service, reserved_hosts, resume):
+    global FAILED_HOSTS  # Declare global FAILED_HOSTS
 
     if not resume:
         try:
@@ -698,9 +754,9 @@ def process_service(service, reserved_hosts, resume):
 
     try:
         conn = nova_login(username, password, projectname, auth_url, user_domain_name, project_domain_name)
-
     except Exception as e:
         logging.error("Failed: Unable to connect to Nova: " + str(e))
+        return False
 
     if not resume:
         try:
@@ -736,18 +792,19 @@ def process_service(service, reserved_hosts, resume):
 
     try:
         logging.info('Start evacuation of %s' % service.host)
-        evacuation_result = _host_evacuate(conn, service.host)
+        evacuation_result = _host_evacuate(conn, service)
     except Exception as e:
         logging.error('Failed to evacuate %s: %s' % (service.host, e))
         logging.debug('Exception traceback:', exc_info=True)
+        evacuation_result = False
         return False
 
     if evacuation_result:
         if 'true' in LEAVE_DISABLED.lower():
-            logging.info('Evacuation successful. Not re-enabling %s since LEAVE_DISABLED is set to %s' % (service.host, LEAVE_DISABLED))
+            logging.info('Instances evacuation successful. Not re-enabling %s since LEAVE_DISABLED is set to %s' % (service.host, LEAVE_DISABLED))
             return True
         else:
-            logging.info('Evacuation successful. Re-enabling %s' % service.host)
+            logging.info('Instances evacuation successful. Since LEAVE_DISABLED is set to %s, re-enabling %s' % (LEAVE_DISABLED, service.host))
 
             try:
                 _host_fence(service.host, 'on')
@@ -764,10 +821,11 @@ def process_service(service, reserved_hosts, resume):
                 return False
             return True
 
-
 def main():
     global current_hash
     global hash_update_successful
+    global FAILED_EVACUATIONS
+    global FAILED_HOSTS
 
     health_check_thread = threading.Thread(target=start_health_check_server)
     health_check_thread.daemon = True
@@ -816,11 +874,12 @@ def main():
 
         # We check if a host is still up but has not been reporting its state for the last DELTA seconds or if it is down.
         # We filter previously disabled hosts or the ones that are forced_down.
-        compute_nodes = [service for service in services if (datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down') and 'disabled' not in service.status and not service.forced_down]
+        compute_nodes = [service for service in services
+                         if ((datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down'))
+                         and 'disabled' not in service.status and not service.forced_down and service.host not in FAILED_HOSTS]
 
         # Let's check if there are computes nodes that were already being processed, we want to check them again in case the pod was restarted
-        to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason]
-
+        to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason and 'evacuation FAILED' not in service.disabled_reason and service.host not in FAILED_HOSTS]
 
         if not (compute_nodes + to_resume) == []:
             logging.warning('The following computes are down:' + str([service.host for service in compute_nodes]))
@@ -864,7 +923,7 @@ def main():
                         with concurrent.futures.ThreadPoolExecutor() as executor:
                             results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
                         if not all(results):
-                            logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
+                            logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
                         # process computes that were half-evacuated
                         with concurrent.futures.ThreadPoolExecutor() as executor:
                             results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
@@ -875,24 +934,25 @@ def main():
                         logging.info('InstanceHa DISABLE is true, not evacuating')
 
         # We need to wait until a compute is back and for the migrations to move from 'done' to 'completed' before we can force_down=false
+        to_reenable = [service for service in services if service.status == 'disabled' and service.forced_down and service.host not in FAILED_HOSTS]
 
-        to_reenable = [service for service in services if 'enabled' in service.status and service.forced_down]
         if to_reenable:
-            logging.debug('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
+            logging.info('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
 
             # list all the migrations having each compute as source, if they are all completed go ahead and re-enable it
-            for i in to_reenable:
-                migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
-                incomplete = [a.id for a in migr if 'completed' not in a.status]
-                if incomplete == []:
-                    logging.debug('All migrations completed, reenabling %s' % i.host)
+            for service in to_reenable:
+                migr = conn.migrations.list(source_compute=service.host, migration_type='evacuation', limit='100')
+                incomplete = [instance.id for instance in migr if 'completed' not in instance.status]
+                if not incomplete:
+                    logging.info('All migrations completed, reenabling %s' % service.host)
                     try:
-                        _host_enable(conn, i, reenable=True)
+                        _host_enable(conn, service, reenable=True)
                     except Exception as e:
                         logging.error('Failed to enable %s: %s' % (service.host, e))
                         logging.debug('Exception traceback:', exc_info=True)
                 else:
-                    logging.debug('At least one migration not completed %s, not reenabling %s' % (incomplete, i.host) )
+                    logging.warning('At least one migration not completed %s, not reenabling %s' % (incomplete, service.host))
+                    FAILED_HOSTS.add(service.host)
 
         time.sleep(POLL)
 
