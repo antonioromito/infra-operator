@@ -19,6 +19,7 @@ import threading
 import hashlib
 from http import server
 import json
+import queue
 
 from novaclient import client
 from novaclient.exceptions import Conflict, NotFound, Forbidden, Unauthorized
@@ -35,6 +36,86 @@ UDP_PORT =  os.getenv('UDP_PORT', 7410)
 
 current_hash = ""
 hash_update_successful = True
+
+# Global variables for UDP thread management
+udp_thread = None
+udp_queue = queue.Queue()
+udp_stop_event = threading.Event()
+
+class KdumpUDPThread(threading.Thread):
+    """Dedicated thread for handling UDP kdump messages"""
+    
+    def __init__(self):
+        super().__init__()
+        self.daemon = True
+        self.sock = None
+        self.running = False
+        
+    def run(self):
+        """Main thread loop for UDP packet processing"""
+        global udp_stop_event
+        
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(1)  # Short timeout for responsiveness
+            self.sock.bind((UDP_IP, UDP_PORT))
+            logging.info('UDP kdump thread started on port %s' % UDP_PORT)
+            self.running = True
+            
+            while not udp_stop_event.is_set():
+                try:
+                    data, ancdata, msg_flags, address = self.sock.recvmsg(65535, 1024, 0)
+                    
+                    # Process the UDP packet
+                    hostname = self._process_kdump_packet(data, address)
+                    if hostname:
+                        udp_queue.put(hostname)
+                        
+                except socket.timeout:
+                    # Expected timeout, continue
+                    continue
+                except Exception as e:
+                    if not udp_stop_event.is_set():
+                        logging.error('Error in UDP thread: %s' % e)
+                    break
+                    
+        except Exception as e:
+            logging.error('Failed to start UDP thread: %s' % e)
+        finally:
+            if self.sock:
+                self.sock.close()
+            self.running = False
+            logging.info('UDP kdump thread stopped')
+    
+    def _process_kdump_packet(self, data, address):
+        """Process kdump UDP packet and return hostname if valid"""
+        FENCE_KDUMP_MAGIC = "0x1B302A40"
+        
+        try:
+            # Check magic number
+            if hex(struct.unpack('ii', data)[0]).upper() != FENCE_KDUMP_MAGIC.upper():
+                logging.debug("Invalid magic number in kdump packet")
+                return None
+                
+            # Get hostname from address
+            name = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
+            logging.debug('Received kdump message from host: %s' % name)
+            return name
+            
+        except Exception as e:
+            logging.error('Failed to process kdump packet: %s' % e)
+            return None
+    
+    def stop(self):
+        """Stop the UDP thread gracefully"""
+        global udp_stop_event
+        udp_stop_event.set()
+        if self.sock:
+            self.sock.close()
+        self.join(timeout=5)
+        if self.is_alive():
+            logging.warning('UDP thread did not stop gracefully')
+
 
 class HealthCheckServer(server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -56,6 +137,22 @@ def start_health_check_server():
     server_address = ('', 8080)
     httpd = server.HTTPServer(server_address, HealthCheckServer)
     httpd.serve_forever()
+
+def start_udp_thread():
+    """Start the dedicated UDP thread for kdump messages"""
+    global udp_thread
+    if udp_thread is None or not udp_thread.is_alive():
+        udp_thread = KdumpUDPThread()
+        udp_thread.start()
+        return udp_thread
+    return udp_thread
+
+def stop_udp_thread():
+    """Stop the UDP thread gracefully"""
+    global udp_thread
+    if udp_thread and udp_thread.is_alive():
+        udp_thread.stop()
+        udp_thread = None
 
 with open("/var/lib/instanceha/config.yaml", 'r') as stream:
     try:
@@ -341,7 +438,13 @@ def _server_evacuate_future(connection, server):
 
             time.sleep(10)
 
+            # Add timeout for evacuation status polling
+            evacuation_timeout = time.time() + 600  # 10 minutes maximum
             while True:
+                if time.time() > evacuation_timeout:
+                    logging.error("Evacuation timeout reached for %s" % response["uuid"])
+                    result = False
+                    break
 
                 status = _server_evacuation_status(connection, server.id)
 
@@ -435,44 +538,29 @@ def _host_disable(connection, service):
 
 
 def _check_kdump(host):
-    FENCE_KDUMP_MAGIC = "0x1B302A40"
-
-    t_end = time.time() + KDUMP_TIMEOUT
-
-    # we use a set since it doesn't allow duplicates
-    dumping = set()
-
-    while time.time() < t_end:
-
-        try:
-            data, ancdata, msg_flags, address = sock.recvmsg(65535, 1024, 0)
-        except OSError as msg:
-            logging.info('No kdump msg received in %s seconds' % KDUMP_TIMEOUT)
-            return False
-
-        #logging.debug("received message: %s %s %s %s" % (hex(struct.unpack('ii',data)[0]), ancdata, msg_flags, address))
-        #logging.debug("address is %s" % address[0])
-
-        # short hostname
-        try:
-            name = socket.gethostbyaddr(address[0])[0].split('.', 1)[0]
-        except Exception as msg:
-            logging.error('Failed reverse dns lookup for: %s - %s' % (address[0], msg))
-            return False
-
-        # fence_kdump checks if the magic number matches, so let's do it here too
-        if hex(struct.unpack('ii',data)[0]).upper() != FENCE_KDUMP_MAGIC.upper() :
-            logging.debug("invalid magic number - did not match %s" % hex(struct.unpack('ii',data)[0]).upper())
-            return False
-
-        # this prints the msg version (0x1) so not sure if we need this at all
-        # logging.debug(hex(struct.unpack('ii',data)[1]))
-
-        dumping.add(name)
-
-    if dumping:
-        return True if host.split('.', 1)[0] in dumping else False
-
+    """Check if a host is kdumping using the dedicated UDP thread"""
+    global udp_queue
+    
+    # Start UDP thread if not already running
+    if 'true' in CHECK_KDUMP.lower():
+        start_udp_thread()
+    
+    # Check if we have any kdump messages for this host
+    host_short = host.split('.', 1)[0]
+    
+    # Check queue for recent kdump messages
+    try:
+        while not udp_queue.empty():
+            kdump_host = udp_queue.get_nowait()
+            if kdump_host == host_short:
+                logging.info('Host %s is kdumping' % host)
+                return True
+    except queue.Empty:
+        pass
+    
+    # Add small delay to prevent rapid repeated calls
+    time.sleep(0.1)
+    
     return False
 
 
@@ -531,10 +619,15 @@ def _bmh_fence(token, namespace, host, action):
             timeout_at = time.time() + 30
             while time.time() < timeout_at:
               time.sleep(3)
-              s = requests.get(url, headers=headers, verify=cacert)
-              poweredon = json.loads(s.text)['status']['poweredOn']
-              if not poweredon:
-                break
+              try:
+                  s = requests.get(url, headers=headers, verify=cacert)
+                  poweredon = json.loads(s.text)['status']['poweredOn']
+                  if not poweredon:
+                    break
+              except Exception as e:
+                  logging.error('Error checking power status for %s: %s' % (host, e))
+                  # Continue waiting but log the error
+                  continue
             return not poweredon
     else:
         ann={"metadata":{"annotations":{"reboot.metal3.io/iha":None}}}
@@ -555,9 +648,13 @@ def _host_fence(host, action):
     # let's check if a host is dumping and wait until it is done before fencing it
     if action == 'off' and 'true' in CHECK_KDUMP.lower():
         logging.info('CHECK_KDUMP=true - waiting for kdump messages')
-        while _check_kdump(host):
+        timeout = time.time() + 300  # 5 minutes maximum wait
+        while _check_kdump(host) and time.time() < timeout:
             logging.info('Compute: %s is kdumping, waiting before evacuation' % host)
             time.sleep(10)
+        
+        if time.time() >= timeout:
+            logging.warning('Timeout reached while waiting for kdump to complete on %s, proceeding with fencing' % host)
 
     if 'noop' in fencing_data["agent"]:
         logging.warning('Using noop fencing agent. VMs may get corrupted.')
@@ -780,6 +877,10 @@ def main():
     health_check_thread.daemon = True
     health_check_thread.start()
 
+    # Start UDP thread if kdump checking is enabled
+    if 'true' in CHECK_KDUMP.lower():
+        start_udp_thread()
+
     previous_hash = ""
 
     CLOUD = os.getenv('OS_CLOUD', 'overcloud')
@@ -801,128 +902,126 @@ def main():
     except Exception as e:
         logging.error("Failed: Unable to connect to Nova: " + str(e))
 
-    while True:
-        current_time = str(time.time()).encode('utf-8')
-        new_hash = hashlib.sha256(current_time).hexdigest()
+    try:
+        while True:
+            current_time = str(time.time()).encode('utf-8')
+            new_hash = hashlib.sha256(current_time).hexdigest()
 
-        if new_hash == previous_hash:
-            logging.error("Hash has not changed. Something went wrong.")
-            hash_update_successful = False
-        else:
-            logging.debug("Hash updated successfully.")
-            current_hash = new_hash
-            hash_update_successful = True
+            if new_hash == previous_hash:
+                logging.error("Hash has not changed. Something went wrong.")
+                hash_update_successful = False
+            else:
+                logging.debug("Hash updated successfully.")
+                current_hash = new_hash
+                hash_update_successful = True
 
-        previous_hash = current_hash
+            previous_hash = current_hash
 
-        try:
-            services = conn.services.list(binary="nova-compute")
+            try:
+                services = conn.services.list(binary="nova-compute")
 
-            # How fast do we want to react / how much do we want to wait before considering a host worth of our attention
-            # We take the current time and subtract a DELTA amount of seconds to have a point in time threshold
-            target_date = datetime.now() - timedelta(seconds=DELTA)
+                # How fast do we want to react / how much do we want to wait before considering a host worth of our attention
+                # We take the current time and subtract a DELTA amount of seconds to have a point in time threshold
+                target_date = datetime.now() - timedelta(seconds=DELTA)
 
-            # We check if a host is still up but has not been reporting its state for the last DELTA seconds or if it is down.
-            # We filter previously disabled hosts or the ones that are forced_down.
-            compute_nodes = [service for service in services if (datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down') and 'disabled' not in service.status and not service.forced_down]
+                # We check if a host is still up but has not been reporting its state for the last DELTA seconds or if it is down.
+                # We filter previously disabled hosts or the ones that are forced_down.
+                compute_nodes = [service for service in services if (datetime.fromisoformat(service.updated_at) < target_date and service.state != 'down') or (service.state == 'down') and 'disabled' not in service.status and not service.forced_down]
 
-            # Let's check if there are computes nodes that were already being processed, we want to check them again in case the pod was restarted
-            to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason and 'evacuation FAILED' not in service.disabled_reason]
+                # Let's check if there are computes nodes that were already being processed, we want to check them again in case the pod was restarted
+                to_resume = [service for service in services if service.forced_down and (service.state == 'down') and 'disabled' in service.status and 'instanceha evacuation' in service.disabled_reason and 'evacuation FAILED' not in service.disabled_reason]
 
-            if not (compute_nodes + to_resume) == []:
-                logging.warning('The following computes are down:' + str([service.host for service in compute_nodes]))
+                if not (compute_nodes + to_resume) == []:
+                    logging.warning('The following computes are down:' + str([service.host for service in compute_nodes]))
 
-                # Filter out computes that have no vms running (we don't want to waste time evacuating those anyway)
-                compute_nodes = [service for service in compute_nodes if service not in [c for c in compute_nodes if not conn.servers.list(search_opts={'host': c.host, 'all_tenants': 1})]]
+                    # Filter out computes that have no vms running (we don't want to waste time evacuating those anyway)
+                    compute_nodes = [service for service in compute_nodes if service not in [c for c in compute_nodes if not conn.servers.list(search_opts={'host': c.host, 'all_tenants': 1})]]
 
-                # Get list of reserved hosts (if feature is enabled)
-                reserved_hosts = [service for service in services if ('disabled' in service.status and 'reserved' in service.disabled_reason )] if 'true' in RESERVED_HOSTS.lower() else []
-                logging.debug('List of reserved hosts: %s' % [h.host for h in reserved_hosts])
+                    # Get list of reserved hosts (if feature is enabled)
+                    reserved_hosts = [service for service in services if ('disabled' in service.status and 'reserved' in service.disabled_reason )] if 'true' in RESERVED_HOSTS.lower() else []
+                    logging.debug('List of reserved hosts: %s' % [h.host for h in reserved_hosts])
 
-                # Check if there are images, flavors or aggregates configured with the EVACUABLE tag
-                images = _get_evacuable_images(conn) if TAGGED_IMAGES else []
-                flavors = _get_evacuable_flavors(conn) if TAGGED_FLAVORS else []
+                    # Check if there are images, flavors or aggregates configured with the EVACUABLE tag
+                    images = _get_evacuable_images(conn) if TAGGED_IMAGES else []
+                    flavors = _get_evacuable_flavors(conn) if TAGGED_FLAVORS else []
 
-                if flavors or images:
-                    compute_nodes = [s for s in compute_nodes if [v for v in conn.servers.list(search_opts={'host': s.host, 'all_tenants': 1 }) if _is_server_evacuable(v, flavors, images)]]
+                    if flavors or images:
+                        compute_nodes = [s for s in compute_nodes if [v for v in conn.servers.list(search_opts={'host': s.host, 'all_tenants': 1 }) if _is_server_evacuable(v, flavors, images)]]
 
-                if 'true' in TAGGED_AGGREGATES.lower():
-                    compute_nodes_down = compute_nodes
-                    # Filter out computes not part of evacuable aggregates (if any aggregate is tagged, otherwise evacuate them all)
-                    compute_nodes = [service for service in compute_nodes if _is_aggregate_evacuable(conn, service.host)]
-                    # Override services to only account the ones that are part of evacuable aggregates
-                    services = [service for service in services if _is_aggregate_evacuable(conn, service.host)]
-                    # warn user about non tagged computes
-                    down_not_tagged = [service.host for service in compute_nodes_down if service not in compute_nodes]
-                    if down_not_tagged:
-                        logging.warning('The following computes are not part of an evacuable aggregate, so they will not be recovered: %s' % down_not_tagged)
+                    if 'true' in TAGGED_AGGREGATES.lower():
+                        compute_nodes_down = compute_nodes
+                        # Filter out computes not part of evacuable aggregates (if any aggregate is tagged, otherwise evacuate them all)
+                        compute_nodes = [service for service in compute_nodes if _is_aggregate_evacuable(conn, service.host)]
+                        # Override services to only account the ones that are part of evacuable aggregates
+                        services = [service for service in services if _is_aggregate_evacuable(conn, service.host)]
+                        # warn user about non tagged computes
+                        down_not_tagged = [service.host for service in compute_nodes_down if service not in compute_nodes]
+                        if down_not_tagged:
+                            logging.warning('The following computes are not part of an evacuable aggregate, so they will not be recovered: %s' % down_not_tagged)
 
-                logging.debug('List of stale services is %s' % [service.host for service in compute_nodes])
+                    logging.debug('List of stale services is %s' % [service.host for service in compute_nodes])
 
-                if compute_nodes or to_resume:
-                    if (len(compute_nodes) / len(services) * 100) > THRESHOLD:
-                        logging.error('Number of impacted computes exceeds the defined threshold. There is something wrong. Not evacuating.')
-                        pass
-                    else:
-                        # Check if some of these computes are crashed and currently kdumping
-                        to_evacuate = compute_nodes
-
-                        # if check_kdump is true let's listen for messages
-                        if 'true' in CHECK_KDUMP.lower():
-                            try:
-                                global sock
-                                #if socket.has_dualstack_ipv6():
-                                #    sock = socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
-                                #else:
-                                #    sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-                                sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-                                sock.settimeout(KDUMP_TIMEOUT)
-                                sock.bind((UDP_IP, UDP_PORT))
-                            except:
-                                logging.error('Could not bind to %s on port %s' % (UDP_IP,UDP_PORT))
-                                return 1
-
-                        if 'false' in DISABLED.lower():
-                            # process computes that are seen as down for the first time
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
-                                results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
-                            if not all(results):
-                                logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
-                            # process computes that were half-evacuated
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
-                                results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
-                            if not all(results):
-                                logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
-
+                    if compute_nodes or to_resume:
+                        if (len(compute_nodes) / len(services) * 100) > THRESHOLD:
+                            logging.error('Number of impacted computes exceeds the defined threshold. There is something wrong. Not evacuating.')
+                            pass
                         else:
-                            logging.info('InstanceHa DISABLE is true, not evacuating')
+                            # if check_kdump is true let's start the dedicated UDP thread
+                            if 'true' in CHECK_KDUMP.lower():
+                                try:
+                                    start_udp_thread()
+                                    logging.info('Dedicated UDP thread started for kdump monitoring')
+                                except Exception as e:
+                                    logging.error('Failed to start UDP thread: %s' % e)
+                                    logging.warning('Continuing without kdump check')
+                            
+                            to_evacuate = compute_nodes
 
-            # We need to wait until a compute is back and for the migrations to move from 'done' to 'completed' before we can force_down=false
+                            if 'false' in DISABLED.lower():
+                                # process computes that are seen as down for the first time
+                                with concurrent.futures.ThreadPoolExecutor() as executor:
+                                    results = list(executor.map(lambda service: process_service(service, reserved_hosts, False), to_evacuate))
+                                if not all(results):
+                                    logging.warning('Some services failed to evacuate. Retrying in 30 seconds.')
+                                # process computes that were half-evacuated
+                                with concurrent.futures.ThreadPoolExecutor() as executor:
+                                    results = list(executor.map(lambda service: process_service(service, reserved_hosts, True), to_resume))
+                                if not all(results):
+                                    logging.warning('Some services failed to evacuate. Retrying in %s seconds.' % POLL)
 
-            to_reenable = [service for service in services if 'enabled' in service.status and service.forced_down]
-            if to_reenable:
-                logging.debug('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
+                            else:
+                                logging.info('InstanceHa DISABLE is true, not evacuating')
 
-                # list all the migrations having each compute as source, if they are all completed (or failed) go ahead and re-enable it
-                for i in to_reenable:
-                    migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
-                    # users can bypass the safety net by setting FORCE_ENABLE=true
-                    incomplete = [a.id for a in migr if 'completed' not in a.status and 'error' not in a.status] if 'false' in FORCE_ENABLE else []
+                # We need to wait until a compute is back and for the migrations to move from 'done' to 'completed' before we can force_down=false
 
-                    if incomplete == []:
-                        logging.info('All migrations completed, reenabling %s' % i.host)
-                        try:
-                            _host_enable(conn, i, reenable=True)
-                        except Exception as e:
-                            logging.error('Failed to enable %s: %s' % (service.host, e))
-                            logging.debug('Exception traceback:', exc_info=True)
-                    else:
-                        logging.warning('At least one migration not completed %s, not reenabling %s' % (incomplete, i.host) )
+                to_reenable = [service for service in services if 'enabled' in service.status and service.forced_down]
+                if to_reenable:
+                    logging.debug('The following computes have forced_down=true, checking if they can be re-enabled: %s' % repr(to_reenable))
 
-        except Exception as e:
-            logging.warning("Failed to query compute status. Please check the Nova Api availability.")
+                    # list all the migrations having each compute as source, if they are all completed (or failed) go ahead and re-enable it
+                    for i in to_reenable:
+                        migr = conn.migrations.list(source_compute=i.host, migration_type='evacuation', limit='100')
+                        # users can bypass the safety net by setting FORCE_ENABLE=true
+                        incomplete = [a.id for a in migr if 'completed' not in a.status and 'error' not in a.status] if 'false' in FORCE_ENABLE else []
 
-        time.sleep(POLL)
+                        if incomplete == []:
+                            logging.info('All migrations completed, reenabling %s' % i.host)
+                            try:
+                                _host_enable(conn, i, reenable=True)
+                            except Exception as e:
+                                logging.error('Failed to enable %s: %s' % (service.host, e))
+                                logging.debug('Exception traceback:', exc_info=True)
+                        else:
+                            logging.warning('At least one migration not completed %s, not reenabling %s' % (incomplete, i.host) )
+
+            except Exception as e:
+                logging.warning("Failed to query compute status. Please check the Nova Api availability.")
+
+            time.sleep(POLL)
+    finally:
+        # Cleanup UDP thread on exit
+        stop_udp_thread()
+        logging.info('InstanceHA shutting down, UDP thread stopped')
 
 
 if __name__ == "__main__":
