@@ -22,6 +22,24 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - nodes
+  - persistentvolumes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods/exec
   verbs:
   - create
@@ -317,6 +335,41 @@ rules:
   - patch
   - update
 - apiGroups:
+  - remediation.medik8s.io
+  resources:
+  - nodehealthchecks
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - remediation.openstack.org
+  resources:
+  - podremediators
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - remediation.openstack.org
+  resources:
+  - podremediators/finalizers
+  verbs:
+  - patch
+  - update
+- apiGroups:
+  - remediation.openstack.org
+  resources:
+  - podremediators/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - security.openshift.io
   resourceNames:
   - anyuid
@@ -324,6 +377,22 @@ rules:
   - securitycontextconstraints
   verbs:
   - use
+- apiGroups:
+  - self-node-remediation.medik8s.io
+  resources:
+  - selfnoderemediationtemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - topology.openstack.org
   resources:

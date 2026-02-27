@@ -43,6 +43,7 @@ import (
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
@@ -913,6 +914,38 @@ func GetBGPConfigurationSpec(namespace string) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+func CreatePodRemediator(namespace string, spec map[string]any) client.Object {
+	name := uuid.New().String()
+	raw := map[string]any{
+		"apiVersion": "remediation.openstack.org/v1beta1",
+		"kind":       "PodRemediator",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": spec,
+	}
+	return th.CreateUnstructured(raw)
+}
+
+func GetPodRemediator(name types.NamespacedName) *remediationv1.PodRemediator {
+	instance := &remediationv1.PodRemediator{}
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, name, instance)).Should(Succeed())
+	}, timeout, interval).Should(Succeed())
+	return instance
+}
+
+func GetPodRemediatorSpec(enablePVCRemediation bool, namespaces []string) map[string]any {
+	spec := map[string]any{
+		"enablePVCRemediation": enablePVCRemediation,
+	}
+	if namespaces != nil {
+		spec["namespaces"] = namespaces
+	}
+	return spec
 }
 
 func GetFRRConfiguration(name types.NamespacedName) *frrk8sv1.FRRConfiguration {

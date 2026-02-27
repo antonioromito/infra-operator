@@ -46,11 +46,13 @@ import (
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
+	remediationv1 "github.com/openstack-k8s-operators/infra-operator/apis/remediation/v1beta1"
 	rabbitmqclusterv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
 
 	memcached_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/memcached"
 	network_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/network"
 	rabbitmq_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/rabbitmq"
+	remediation_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/remediation"
 
 	webhookmemcachedv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/memcached/v1beta1"
 	webhooknetworkv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/network/v1beta1"
@@ -163,6 +165,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = topologyv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	err = remediationv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 	err = ocp_configv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = rabbitmqv1.AddToScheme(scheme.Scheme)
@@ -256,6 +260,14 @@ var _ = BeforeSuite(func() {
 		Client:  k8sManager.GetClient(),
 		Scheme:  k8sManager.GetScheme(),
 		Kclient: kclient,
+	}).SetupWithManager(context.Background(), k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&remediation_ctrl.PodRemediatorReconciler{
+		Client:         k8sManager.GetClient(),
+		Scheme:         k8sManager.GetScheme(),
+		Kclient:        kclient,
+		DynamicClient:  dynClient,
 	}).SetupWithManager(context.Background(), k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
