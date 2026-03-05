@@ -1,0 +1,13 @@
+apiVersion: remediation.openstack.org/v1beta1
+kind: PodRemediator
+metadata:
+  name: podremediator-sample
+  labels:
+    app.kubernetes.io/name: podremediator
+    app.kubernetes.io/instance: podremediator-sample
+    app.kubernetes.io/part-of: infra-operator
+spec:
+  # Namespaces to watch for pods with local PVCs. Empty means the CR's namespace only.
+  namespaces: []
+  # Enable deletion of stuck local PVCs when a node is remediated by NHC/SNR.
+  enablePVCRemediation: true

@@ -45,3 +45,6 @@ go.work.sum
 .coverage
 __pycache__/
 *.pyc
+
+# local oc client download
+.tmp/

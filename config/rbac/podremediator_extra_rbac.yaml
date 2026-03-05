@@ -1,0 +1,41 @@
+# Supplemental ClusterRole + Binding for PodRemediator when the operator
+# is deployed via OLM/OpenStack operator and the default role lacks
+# cluster-scoped persistentvolumes, persistentvolumeclaims and remediation.openstack.org resources.
+# Apply with: oc apply -f config/rbac/podremediator_extra_rbac.yaml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: infra-operator-podremediator-extra
+rules:
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [persistentvolumes]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get, list, watch, update, patch, delete]
+- apiGroups: [remediation.openstack.org]
+  resources: [podremediators, podremediators/status, podremediators/finalizers]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [remediation.medik8s.io]
+  resources: [nodehealthchecks]
+  verbs: [get, list, watch]
+- apiGroups: [self-node-remediation.medik8s.io]
+  resources: [selfnoderemediationtemplates]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: infra-operator-podremediator-extra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: infra-operator-podremediator-extra
+subjects:
+- kind: ServiceAccount
+  name: infra-operator-controller-manager
+  namespace: openstack-operators
