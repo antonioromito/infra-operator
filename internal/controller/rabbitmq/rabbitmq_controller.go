@@ -23,6 +23,7 @@ import (
 	cryptotls "crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -415,6 +416,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 					if bookkeepingErr := r.CheckForStuckPVCRequiringRemediation(ctx, applied, helper,
 						RemediationDecision{RecoveryInFlight: true}); bookkeepingErr != nil {
 						instance.Status.PVCRemediation = applied.Status.PVCRemediation
+						if setQueueProofDeadlineCondition(instance, bookkeepingErr) {
+							Log.Error(bookkeepingErr, "PVC recovery queue proof exceeded its time budget")
+							return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+						}
 						Log.Info("Applied-TLS PVC recovery bookkeeping deferred", "reason", bookkeepingErr.Error())
 						return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 					}
@@ -613,6 +618,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			RemediationDecision{RecoveryInFlight: true})
 		syncRecoveryStatus()
 		if err != nil {
+			if setQueueProofDeadlineCondition(instance, err) {
+				Log.Error(err, "Applied-spec PVC recovery queue proof exceeded its time budget")
+				return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+			}
 			Log.Info("Applied-spec PVC recovery bookkeeping deferred", "reason", err.Error())
 			return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 		}
@@ -1200,6 +1209,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		consentDecision.AllowNewConsent = false
 	}
 	if err := r.CheckForStuckPVCRequiringRemediation(ctx, instance, helper, consentDecision); err != nil {
+		if setQueueProofDeadlineCondition(instance, err) {
+			Log.Error(err, "PVC remediation queue proof exceeded its time budget")
+			return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+		}
 		Log.Info("PVC remediation consent deferred; requeuing", "reason", err.Error())
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
@@ -2086,6 +2099,45 @@ type rmqQueueStatus struct {
 	Online  []string `json:"online"`
 }
 
+type queueInventory []rmqQueueStatus
+
+type queueProofDeadlineError struct {
+	QueueCount int
+	Err        error
+}
+
+func (e *queueProofDeadlineError) Error() string {
+	return fmt.Sprintf("RabbitMq queue safety proof exceeded its deadline after reading %d queues: %v", e.QueueCount, e.Err)
+}
+
+func (e *queueProofDeadlineError) Unwrap() error {
+	return e.Err
+}
+
+func queueProofResult(ctx context.Context, queueCount int, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if err == nil {
+			err = ctx.Err()
+		}
+		return &queueProofDeadlineError{QueueCount: queueCount, Err: err}
+	}
+	return err
+}
+
+func setQueueProofDeadlineCondition(instance *rabbitmqv1beta1.RabbitMq, err error) bool {
+	var deadlineErr *queueProofDeadlineError
+	if !errors.As(err, &deadlineErr) {
+		return false
+	}
+	instance.Status.Conditions.Set(condition.FalseCondition(
+		condition.ReadyCondition,
+		"QueueProofDeadlineExceeded",
+		condition.SeverityWarning,
+		"RabbitMQ could not verify queue safety within the time budget after reading %d queues",
+		deadlineErr.QueueCount))
+	return true
+}
+
 // rmqLoadMgmtCreds reads the default-user secret (username/password) and, when TLS is
 // enabled, the CA secret used to verify the RabbitMQ management HTTP API endpoint.
 func (r *Reconciler) rmqLoadMgmtCreds(ctx context.Context, instance *rabbitmqv1beta1.RabbitMq) (*rmqMgmtCreds, error) {
@@ -2230,46 +2282,152 @@ func (r *Reconciler) rmqClusterNodes(ctx context.Context, instance *rabbitmqv1be
 	return nodes, nil
 }
 
-// scanQueues reads every queue from one GET /api/queues/detailed response,
-// de-duplicating the result before invoking perQueue. A single response avoids
+// loadQueueInventory reads every queue from one GET /api/queues/detailed
+// response and validates the common identity fields. A single response avoids
 // page-offset races that could omit a queue when the queue set changed between
-// requests. perQueue may return an error to abort the scan; "soft" conditions a
-// caller wants to evaluate only after a complete pass (e.g. a queue still
-// missing a replica) should be recorded in the closure and checked after
-// scanQueues returns nil. An empty cluster returns nil.
-func (r *Reconciler) scanQueues(
+// requests. Type-specific checks remain separate methods on queueInventory.
+func (r *Reconciler) loadQueueInventory(
 	ctx context.Context,
 	instance *rabbitmqv1beta1.RabbitMq,
 	pod *corev1.Pod,
 	creds *rmqMgmtCreds,
 	columns string,
-	perQueue func(rmqQueueStatus) error,
-) error {
+) (queueInventory, error) {
 	httpClient, err := r.rmqManagementClient(ctx, instance, pod, creds)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var queues []rmqQueueStatus
 	path := "/api/queues/detailed?columns=" + columns
 	if err := r.rmqManagementGet(ctx, instance, pod, httpClient, creds, path, &queues); err != nil {
-		return err
+		return nil, err
 	}
 	if queues == nil {
-		return fmt.Errorf("RabbitMq queue scan did not return an array")
+		return nil, fmt.Errorf("RabbitMq queue scan did not return an array")
 	}
 	seenQueues := map[string]bool{}
 	for i := range queues {
 		queue := queues[i]
 		if queue.Name == "" || queue.Vhost == "" || queue.Type == "" {
-			return fmt.Errorf("RabbitMq queue scan has a queue without name, vhost, or type")
+			return nil, fmt.Errorf("RabbitMq queue scan has a queue without name, vhost, or type")
 		}
 		key := queue.Vhost + "\x00" + queue.Name
 		if seenQueues[key] {
-			return fmt.Errorf("RabbitMq queue %s/%s appears more than once", queue.Vhost, queue.Name)
+			return nil, fmt.Errorf("RabbitMq queue %s/%s appears more than once", queue.Vhost, queue.Name)
 		}
 		seenQueues[key] = true
-		if err := perQueue(queue); err != nil {
+	}
+	return queueInventory(queues), nil
+}
+
+// safeAfterCandidateRemoval applies the cheap safety checks and returns the
+// quorum queues that require the active Ra proof. Every quorum queue is
+// included: a queue that does not host the candidate must still have a working
+// survivor majority before the cluster is treated as healthy enough to mutate.
+func (inventory queueInventory) safeAfterCandidateRemoval(candidateNode string, safeNodes map[string]bool) (queueInventory, error) {
+	quorumQueues := make(queueInventory, 0)
+	for _, queue := range inventory {
+		switch queue.Type {
+		case "stream":
+			// A stream can carry data on the candidate PVC, but RabbitMQ does
+			// not expose the same queue-majority guarantee for streams.
+			if len(queue.Members) == 0 {
+				return nil, fmt.Errorf("RabbitMq stream %s/%s has unknown members", queue.Vhost, queue.Name)
+			}
+			streamMembers := make(map[string]bool, len(queue.Members))
+			for _, member := range queue.Members {
+				if member == "" || streamMembers[member] {
+					return nil, fmt.Errorf("RabbitMq stream %s/%s has ambiguous members", queue.Vhost, queue.Name)
+				}
+				streamMembers[member] = true
+				if member == candidateNode {
+					return nil, fmt.Errorf("RabbitMq stream %s/%s has a replica on the candidate", queue.Vhost, queue.Name)
+				}
+			}
+		case "classic":
+			// Classic queues are single-replica: losing their hosting PVC can
+			// lose durable queue data despite healthy broker cluster quorum.
+			if queue.Durable == nil {
+				return nil, fmt.Errorf("RabbitMq classic queue %s/%s has unknown durability", queue.Vhost, queue.Name)
+			}
+			if *queue.Durable && (queue.Node == "" || queue.Node == candidateNode || !safeNodes[queue.Node]) {
+				return nil, fmt.Errorf("RabbitMq durable classic queue %s/%s has unsafe or unknown hosting node %q", queue.Vhost, queue.Name, queue.Node)
+			}
+		case "quorum":
+			members, online, err := quorumQueueMembers(queue)
+			if err != nil {
+				return nil, err
+			}
+			survivors := 0
+			onlineSurvivors := 0
+			for member := range members {
+				if safeNodes[member] {
+					survivors++
+				}
+				if safeNodes[member] && online[member] {
+					onlineSurvivors++
+				}
+			}
+			if survivors < quorumOf(int32(len(members))) {
+				return nil, fmt.Errorf("RabbitMq quorum queue %s/%s would lose quorum: %d safe members of %d", queue.Vhost, queue.Name, survivors, len(members))
+			}
+			if onlineSurvivors < quorumOf(int32(len(members))) {
+				return nil, fmt.Errorf("RabbitMq quorum queue %s/%s has too few online safe members: %d of %d", queue.Vhost, queue.Name, onlineSurvivors, len(members))
+			}
+			quorumQueues = append(quorumQueues, queue)
+		default:
+			return nil, fmt.Errorf("RabbitMq queue %s/%s has unknown type %s", queue.Vhost, queue.Name, queue.Type)
+		}
+	}
+	return quorumQueues, nil
+}
+
+// requireOnlineOnEveryQuorumQueue reports whether node has an online replica
+// of every quorum queue. It examines the complete inventory before reporting a
+// stable missing/offline reason.
+func (inventory queueInventory) requireOnlineOnEveryQuorumQueue(node string) error {
+	missing := ""
+	offline := ""
+	for _, queue := range inventory {
+		if queue.Type != "quorum" {
+			continue
+		}
+		members, online, err := quorumQueueMembers(queue)
+		if err != nil {
 			return err
+		}
+		if !members[node] {
+			if missing == "" {
+				missing = queue.Vhost + "/" + queue.Name
+			}
+			continue
+		}
+		if !online[node] && offline == "" {
+			offline = queue.Vhost + "/" + queue.Name
+		}
+	}
+	if missing != "" {
+		return fmt.Errorf("RabbitMq quorum queue %s does not include %s yet; waiting for Continuous Membership Reconciliation", missing, node)
+	}
+	if offline != "" {
+		return fmt.Errorf("RabbitMq quorum queue %s replacement member %s is not online yet", offline, node)
+	}
+	return nil
+}
+
+// requireNoQuorumQueueMember returns an error when node still appears in any
+// quorum queue's configured membership.
+func (inventory queueInventory) requireNoQuorumQueueMember(node string) error {
+	for _, queue := range inventory {
+		if queue.Type != "quorum" {
+			continue
+		}
+		members, _, err := quorumQueueMembers(queue)
+		if err != nil {
+			return err
+		}
+		if members[node] {
+			return fmt.Errorf("%w: %s/%s", errOldQueueReplicaPresent, queue.Vhost, queue.Name)
 		}
 	}
 	return nil
@@ -2307,71 +2465,16 @@ func (r *Reconciler) rmqQueuesSafeAfterDeletion(ctx context.Context, instance *r
 	// leaving each HTTP request and CLI command independently bounded.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	quorumQueues := []rmqQueueStatus{}
-	err := r.scanQueues(ctx, instance, pod, creds,
-		"name,vhost,type,node,durable,members,online",
-		func(queue rmqQueueStatus) error {
-			switch queue.Type {
-			case "stream":
-				// A stream can carry data on the candidate PVC, but RabbitMQ does
-				// not expose the same queue-majority guarantee for streams.
-				if len(queue.Members) == 0 {
-					return fmt.Errorf("RabbitMq stream %s/%s has unknown members", queue.Vhost, queue.Name)
-				}
-				streamMembers := make(map[string]bool, len(queue.Members))
-				for _, member := range queue.Members {
-					if member == "" || streamMembers[member] {
-						return fmt.Errorf("RabbitMq stream %s/%s has ambiguous members", queue.Vhost, queue.Name)
-					}
-					streamMembers[member] = true
-					if member == candidateNode {
-						return fmt.Errorf("RabbitMq stream %s/%s has a replica on the candidate", queue.Vhost, queue.Name)
-					}
-				}
-				return nil
-			case "classic":
-				// Classic queues are single-replica: losing their hosting PVC can
-				// lose durable queue data despite healthy broker cluster quorum.
-				if queue.Durable == nil {
-					return fmt.Errorf("RabbitMq classic queue %s/%s has unknown durability", queue.Vhost, queue.Name)
-				}
-				if *queue.Durable {
-					if queue.Node == "" || queue.Node == candidateNode || !safeNodes[queue.Node] {
-						return fmt.Errorf("RabbitMq durable classic queue %s/%s has unsafe or unknown hosting node %q", queue.Vhost, queue.Name, queue.Node)
-					}
-				}
-				return nil
-			case "quorum":
-				members, online, err := quorumQueueMembers(queue)
-				if err != nil {
-					return err
-				}
-				survivors := 0
-				onlineSurvivors := 0
-				for member := range members {
-					if safeNodes[member] {
-						survivors++
-					}
-					if safeNodes[member] && online[member] {
-						onlineSurvivors++
-					}
-				}
-				if survivors < quorumOf(int32(len(members))) {
-					return fmt.Errorf("RabbitMq quorum queue %s/%s would lose quorum: %d safe members of %d", queue.Vhost, queue.Name, survivors, len(members))
-				}
-				if onlineSurvivors < quorumOf(int32(len(members))) {
-					return fmt.Errorf("RabbitMq quorum queue %s/%s has too few online safe members: %d of %d", queue.Vhost, queue.Name, onlineSurvivors, len(members))
-				}
-				quorumQueues = append(quorumQueues, queue)
-				return nil
-			default:
-				return fmt.Errorf("RabbitMq queue %s/%s has unknown type %s", queue.Vhost, queue.Name, queue.Type)
-			}
-		})
+	inventory, err := r.loadQueueInventory(ctx, instance, pod, creds,
+		"name,vhost,type,node,durable,members,online")
 	if err != nil {
-		return err
+		return queueProofResult(ctx, len(inventory), err)
 	}
-	return r.verifyQueueQuorumReads(ctx, pod, quorumQueues, safeNodes)
+	affected, err := inventory.safeAfterCandidateRemoval(candidateNode, safeNodes)
+	if err != nil {
+		return queueProofResult(ctx, len(inventory), err)
+	}
+	return queueProofResult(ctx, len(inventory), r.verifyQueueQuorumReads(ctx, pod, affected, safeNodes))
 }
 
 // rmqRunningSurvivorCount verifies each ready survivor pod maps unambiguously to a

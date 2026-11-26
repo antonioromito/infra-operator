@@ -830,38 +830,11 @@ func (r *Reconciler) verifyQuorumQueueReplicasOnline(
 		return fmt.Errorf("reading management credentials: %w", err)
 	}
 
-	// Record "soft" conditions and decide only after a complete pass, so the
-	// reported reason is not whichever queue happened to be scanned first.
-	missingReplicaQueue := ""
-	offlineReplicaQueue := ""
-	if err := r.scanQueues(ctx, instance, pod, creds,
-		"name,vhost,type,members,online",
-		func(queue rmqQueueStatus) error {
-			if queue.Type != "quorum" {
-				return nil
-			}
-			members, online, err := quorumQueueMembers(queue)
-			if err != nil {
-				return err
-			}
-			if !members[targetNode] {
-				missingReplicaQueue = queue.Vhost + "/" + queue.Name
-				return nil
-			}
-			if !online[targetNode] {
-				offlineReplicaQueue = queue.Vhost + "/" + queue.Name
-			}
-			return nil
-		}); err != nil {
+	inventory, err := r.loadQueueInventory(ctx, instance, pod, creds, "name,vhost,type,members,online")
+	if err != nil {
 		return err
 	}
-	if missingReplicaQueue != "" {
-		return fmt.Errorf("RabbitMq quorum queue %s does not include %s yet; waiting for Continuous Membership Reconciliation", missingReplicaQueue, targetNode)
-	}
-	if offlineReplicaQueue != "" {
-		return fmt.Errorf("RabbitMq quorum queue %s replacement member %s is not online yet", offlineReplicaQueue, targetNode)
-	}
-	return nil
+	return inventory.requireOnlineOnEveryQuorumQueue(targetNode)
 }
 
 // finishNodeRejoin admits a rejoined replacement to client traffic once it

@@ -446,20 +446,11 @@ func (r *Reconciler) consistentMembers(ctx context.Context, instance *rabbitmqv1
 }
 
 func (r *Reconciler) verifyOldQueueReplicasRemoved(ctx context.Context, instance *rabbitmqv1.RabbitMq, peer *corev1.Pod, creds *rmqMgmtCreds, oldNode string) error {
-	return r.scanQueues(ctx, instance, peer, creds, "name,vhost,type,members,online",
-		func(q rmqQueueStatus) error {
-			if q.Type != "quorum" {
-				return nil // Other queue kinds are checked by rmqQueuesSafeAfterDeletion.
-			}
-			members, _, err := quorumQueueMembers(q)
-			if err != nil {
-				return err
-			}
-			if members[oldNode] {
-				return fmt.Errorf("%w: %s/%s", errOldQueueReplicaPresent, q.Vhost, q.Name)
-			}
-			return nil
-		})
+	inventory, err := r.loadQueueInventory(ctx, instance, peer, creds, "name,vhost,type,members,online")
+	if err != nil {
+		return err
+	}
+	return inventory.requireNoQuorumQueueMember(oldNode)
 }
 
 func (r *Reconciler) safeSurvivorNodes(
