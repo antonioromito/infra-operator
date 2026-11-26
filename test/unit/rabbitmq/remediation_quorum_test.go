@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	rabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
@@ -52,14 +53,16 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 		requestID = "request-uid"
 	)
 	testCases := []struct {
-		name            string
-		queues          string
-		wantConsent     bool
-		wantError       bool
-		failStatusPatch bool
-		readFails       bool
-		readOutput      string
-		wantErrorText   string
+		name              string
+		queues            string
+		wantConsent       bool
+		wantError         bool
+		failStatusPatch   bool
+		readFails         bool
+		readOutput        string
+		wantErrorText     string
+		deadline          bool
+		unwrappedDeadline bool
 	}{
 		{
 			name:      "two-member quorum queue loses majority with candidate",
@@ -139,6 +142,20 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 			name:      "queue without identity fails closed",
 			queues:    `[{"type":"classic","durable":false}]`,
 			wantError: true,
+		},
+		{
+			name:          "queue proof deadline is reported explicitly",
+			queues:        `[]`,
+			wantError:     true,
+			wantErrorText: "queue safety proof exceeded its deadline after reading 0 queues",
+			deadline:      true,
+		},
+		{
+			name:              "unwrapped exec deadline is classified from the proof context",
+			queues:            `[{"name":"jobs","vhost":"/","type":"quorum","members":["rabbit@rabbitmq-server-0.rabbitmq-nodes.openstack","rabbit@rabbitmq-server-1.rabbitmq-nodes.openstack","rabbit@rabbitmq-server-2.rabbitmq-nodes.openstack"],"online":["rabbit@rabbitmq-server-0.rabbitmq-nodes.openstack","rabbit@rabbitmq-server-1.rabbitmq-nodes.openstack","rabbit@rabbitmq-server-2.rabbitmq-nodes.openstack"]}]`,
+			wantError:         true,
+			wantErrorText:     "error sending request: context deadline exceeded",
+			unwrappedDeadline: true,
 		},
 	}
 
@@ -232,12 +249,18 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 			}).Build()
 			queueRequests := 0
 			transport := rabbitMQManagementTransport(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path == "/api/queues/detailed" {
+					queueRequests++
+				}
+				if tc.deadline && request.URL.Path == "/api/queues/detailed" {
+					<-request.Context().Done()
+					return nil, request.Context().Err()
+				}
 				var body string
 				switch request.URL.Path {
 				case "/api/nodes":
 					body = `[{"name":"rabbit@rabbitmq-server-0.rabbitmq-nodes.openstack","running":true},{"name":"rabbit@rabbitmq-server-1.rabbitmq-nodes.openstack","running":true},{"name":"rabbit@rabbitmq-server-2.rabbitmq-nodes.openstack","running":true}]`
 				case "/api/queues/detailed":
-					queueRequests++
 					if request.URL.Query().Get("page") != "" || request.URL.Query().Get("page_size") != "" ||
 						!strings.Contains(request.URL.Query().Get("columns"), "node,durable") {
 						return nil, fmt.Errorf("unexpected queue query %s", request.URL.RawQuery)
@@ -249,6 +272,10 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: request}, nil
 			})
 			executor := &fakeExec{quorumReadOutput: tc.readOutput}
+			executor.waitForQuorumCtx = tc.unwrappedDeadline
+			if err := executor.loadQuorumQueueState(tc.queues); err != nil {
+				t.Fatalf("load queue fixture: %v", err)
+			}
 			if tc.readFails {
 				executor.quorumReadErr = fmt.Errorf("Ra group has no elected leader")
 			}
@@ -260,7 +287,13 @@ func TestPVCRemediationConsentChecksQueueMembership(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = rabbitmqReconciler.CheckForStuckPVCRequiringRemediation(context.Background(), instance, crHelper, rabbitmqcontroller.RemediationDecision{AllowNewConsent: true, RecoveryInFlight: true})
+			ctx := context.Background()
+			if tc.deadline || tc.unwrappedDeadline {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
+				defer cancel()
+			}
+			err = rabbitmqReconciler.CheckForStuckPVCRequiringRemediation(ctx, instance, crHelper, rabbitmqcontroller.RemediationDecision{AllowNewConsent: true, RecoveryInFlight: true})
 			if tc.wantError && err == nil {
 				t.Fatal("expected queue safety failure")
 			}

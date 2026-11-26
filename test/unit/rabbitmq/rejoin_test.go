@@ -26,7 +26,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +94,7 @@ type fakeExec struct {
 	consistent        map[string][]string // optional leader membership, independent of the local cache
 	quorumReadErr     error
 	quorumReadOutput  string
+	waitForQuorumCtx  bool
 	afterForget       func()
 }
 
@@ -126,7 +126,7 @@ func (f *fakeExec) applyCMR() {
 	}
 }
 
-func (f *fakeExec) run(_ context.Context, _ kubernetes.Interface, _ *rest.Config, podName types.NamespacedName,
+func (f *fakeExec) run(ctx context.Context, _ kubernetes.Interface, _ *rest.Config, podName types.NamespacedName,
 	_ string, cmd []string, fun func(*bytes.Buffer, *bytes.Buffer) error) error {
 	if len(cmd) >= 5 && cmd[0] == "sh" && cmd[1] == "-c" && cmd[3] == "--" {
 		cmd = cmd[4:] // Execute the intended CLI after the image PATH adapter.
@@ -203,6 +203,10 @@ func (f *fakeExec) run(_ context.Context, _ kubernetes.Interface, _ *rest.Config
 	}
 	if command == "rabbitmqctl" && len(args) > 1 && args[0] == "-q" && args[1] == "eval" {
 		if len(args) > 2 && strings.Contains(args[2], `QUEUE_CONSENSUS=`) {
+			if f.waitForQuorumCtx {
+				<-ctx.Done()
+				return fmt.Errorf("error sending request: %w", ctx.Err())
+			}
 			if f.quorumReadErr != nil {
 				return f.quorumReadErr
 			}
@@ -236,7 +240,6 @@ func (f *fakeExec) run(_ context.Context, _ kubernetes.Interface, _ *rest.Config
 					vhostBytes, _ := base64.StdEncoding.DecodeString(match[1])
 					nameBytes, _ := base64.StdEncoding.DecodeString(match[2])
 					queueName := string(nameBytes)
-					declaredExpected, _ := strconv.Atoi(match[3])
 					nodeMatches := nodePattern.FindAllStringSubmatch(match[4], -1)
 					nodes := make([]string, 0, len(nodeMatches))
 					for _, nodeMatch := range nodeMatches {
@@ -254,9 +257,6 @@ func (f *fakeExec) run(_ context.Context, _ kubernetes.Interface, _ *rest.Config
 						}
 					}
 					expected := len(actualMembers)
-					if len(actualMembers) == len(nodes) {
-						expected = declaredExpected
-					}
 					leader := node(testName + "-server-1")
 					if !actualOnline[leader] {
 						for candidate := range actualOnline {
@@ -322,6 +322,44 @@ func TestFakeExecRejectsMalformedQueueGenerator(t *testing.T) {
 		types.NamespacedName{Name: testName + "-server-1", Namespace: testNS}, "",
 		cmd, func(*bytes.Buffer, *bytes.Buffer) error { return nil }); err == nil {
 		t.Fatal("malformed unbracketed queue generator must be rejected")
+	}
+}
+
+func TestFakeExecDerivesRaMemberCountFromFixtureState(t *testing.T) {
+	fx := newFakeExecWithQuorumQueues(map[string][]string{
+		testName + "-server-1": {node(testName + "-server-1"), node(testName + "-server-2")},
+		testName + "-server-2": {node(testName + "-server-1"), node(testName + "-server-2")},
+	})
+	vhost := base64.StdEncoding.EncodeToString([]byte("/"))
+	queue := base64.StdEncoding.EncodeToString([]byte("orders"))
+	firstJSON := base64.StdEncoding.EncodeToString([]byte(node(testName + "-server-1")))
+	secondJSON := base64.StdEncoding.EncodeToString([]byte(node(testName + "-server-2")))
+	// The request claims a stale count of three while the fixture has two
+	// configured members. The fake must return the fixture count.
+	expression := `Results=[Process(V,N,Expected,Nodes) || {V,N,Expected,Nodes}<-` + `[` +
+		`{base64:decode(<<"` + vhost + `">>),base64:decode(<<"` + queue + `">>),3,[` +
+		`base64:decode(<<"` + firstJSON + `">>),base64:decode(<<"` + secondJSON + `">>)]}]],` +
+		`io:format("QUEUE_CONSENSUS=~ts~n",[rabbit_json:encode(Results)]),ok.`
+	var output bytes.Buffer
+	if err := fx.run(context.Background(), kubernetesfake.NewSimpleClientset(), nil,
+		types.NamespacedName{Name: testName + "-server-1", Namespace: testNS}, "",
+		[]string{"rabbitmqctl", "-q", "eval", expression},
+		func(out *bytes.Buffer, _ *bytes.Buffer) error {
+			output.Write(out.Bytes())
+			return nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	var results []struct {
+		ExpectedMembers int      `json:"expected_members"`
+		Acknowledged    []string `json:"acknowledged"`
+	}
+	line := strings.TrimPrefix(strings.Split(strings.TrimSpace(output.String()), "\n")[0], "QUEUE_CONSENSUS=")
+	if err := json.Unmarshal([]byte(line), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ExpectedMembers != 2 || len(results[0].Acknowledged) != 2 {
+		t.Fatalf("fixture-derived Ra response = %+v, want two members and two acknowledgements", results)
 	}
 }
 
@@ -398,6 +436,32 @@ func newFakeExecWithQuorumQueues(running map[string][]string) *fakeExec {
 		statusErr:         map[string]error{},
 		postForgetRunning: map[string][]string{},
 	}
+}
+
+func (f *fakeExec) loadQuorumQueueState(raw string) error {
+	var queues []struct {
+		Name    string   `json:"name"`
+		Members []string `json:"members"`
+		Online  []string `json:"online"`
+	}
+	if err := json.Unmarshal([]byte(raw), &queues); err != nil {
+		return err
+	}
+	if f.quorumQueueMembers == nil {
+		f.quorumQueueMembers = map[string]map[string]bool{}
+		f.quorumQueueOnline = map[string]map[string]bool{}
+	}
+	for _, queue := range queues {
+		f.quorumQueueMembers[queue.Name] = map[string]bool{}
+		f.quorumQueueOnline[queue.Name] = map[string]bool{}
+		for _, member := range queue.Members {
+			f.quorumQueueMembers[queue.Name][member] = true
+		}
+		for _, member := range queue.Online {
+			f.quorumQueueOnline[queue.Name][member] = true
+		}
+	}
+	return nil
 }
 
 func modelOfflineStaleSeed(fx *fakeExec) {
@@ -1602,24 +1666,50 @@ func TestRejoinFailsClosedOnAmbiguousTargetStatus(t *testing.T) {
 }
 
 func TestRejoinDefersOnAmbiguousAnchorStatus(t *testing.T) {
-	fx := newFakeExecWithQuorumQueues(map[string][]string{
-		testName + "-server-0": {node(testName + "-server-0")},
-		testName + "-server-1": {node(testName + "-server-1"), node(testName + "-server-2")},
-	})
-	fx.statusOutput[testName+"-server-1"] = `{"running_nodes":["` + node(testName+"-server-1") + `","` + node(testName+"-server-2") + `"]}`
+	server1 := node(testName + "-server-1")
+	server2 := node(testName + "-server-2")
+	for _, test := range []struct {
+		name     string
+		status   string
+		wantJoin bool
+	}{
+		{
+			name:   "missing configured membership",
+			status: `{"running_nodes":["` + server1 + `","` + server2 + `"]}`,
+		},
+		{
+			name:     "valid configured membership",
+			status:   `{"disk_nodes":["` + server1 + `","` + server2 + `"],"ram_nodes":[],"running_nodes":["` + server1 + `","` + server2 + `"]}`,
+			wantJoin: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fx := newFakeExecWithQuorumQueues(map[string][]string{
+				testName + "-server-0": {node(testName + "-server-0")},
+				testName + "-server-1": {server1, server2},
+				testName + "-server-2": {server1, server2},
+			})
+			fx.statusOutput[testName+"-server-1"] = test.status
+			fx.statusOutput[testName+"-server-2"] = test.status
 
-	r := newReconciler(t, fx,
-		replacementPVC(newPVCUID),
-		replacementPod(testRequestID),
-		clusterPod(testName+"-server-1", true))
-	requeue, err := r.ReconcileNodeRejoin(context.Background(), instanceAfterMemberRemoval(3), true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !requeue {
-		t.Fatal("expected requeue without a trustworthy quorum anchor")
-	}
-	if fx.orderOf("forget_cluster_node") >= 0 || fx.orderOf("join_cluster") >= 0 || fx.orderOf("rabbitmq-queues grow") >= 0 {
-		t.Errorf("must not mutate membership or queues without complete anchor status, calls=%v", fx.calls)
+			r := newReconciler(t, fx,
+				replacementPVC(newPVCUID),
+				replacementPod(testRequestID),
+				clusterPod(testName+"-server-1", true),
+				clusterPod(testName+"-server-2", true))
+			requeue, err := r.ReconcileNodeRejoin(context.Background(), instanceAfterMemberRemoval(3), true)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !requeue {
+				t.Fatal("expected requeue while replacement recovery is incomplete")
+			}
+			if gotJoin := fx.orderOf("join_cluster") >= 0; gotJoin != test.wantJoin {
+				t.Fatalf("join_cluster called=%v, want %v; calls=%v", gotJoin, test.wantJoin, fx.calls)
+			}
+			if !test.wantJoin && (fx.orderOf("forget_cluster_node") >= 0 || fx.orderOf("rabbitmq-queues grow") >= 0) {
+				t.Errorf("must not mutate membership or queues without complete anchor status, calls=%v", fx.calls)
+			}
+		})
 	}
 }
