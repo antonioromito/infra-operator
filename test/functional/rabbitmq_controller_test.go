@@ -19,6 +19,7 @@ package functional_test
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
@@ -2450,5 +2451,106 @@ var _ = Describe("RabbitMQ Controller", func() {
 					Equal(fmt.Sprintf("%s-default-user", rabbitmqName.Name)))
 			}, timeout, interval).Should(Succeed())
 		})
+	})
+})
+
+var _ = Describe("RabbitMq cluster health reporting", func() {
+	var rabbitmqName types.NamespacedName
+
+	// createReadyBrokerPod gives the controller a pod to send its management
+	// API requests to. No broker runs behind it; rabbitMQMgmt answers instead.
+	createReadyBrokerPod := func(podName string) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      podName,
+				Namespace: rabbitmqName.Namespace,
+				Labels:    map[string]string{"app.kubernetes.io/name": rabbitmqName.Name},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "rabbitmq", Image: "rabbitmq:4.1"},
+			}},
+		}
+		Expect(th.K8sClient.Create(th.Ctx, pod)).Should(Succeed())
+		DeferCleanup(func() {
+			_ = th.K8sClient.Delete(th.Ctx, pod)
+		})
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		}
+		Expect(th.K8sClient.Status().Update(th.Ctx, pod)).Should(Succeed())
+	}
+
+	simulateSTSReady := func() {
+		Eventually(func(g Gomega) {
+			sts := &appsv1.StatefulSet{}
+			g.Expect(th.K8sClient.Get(th.Ctx, types.NamespacedName{
+				Name:      rabbitmqName.Name + "-server",
+				Namespace: rabbitmqName.Namespace,
+			}, sts)).Should(Succeed())
+			sts.Status.ReadyReplicas = 1
+			sts.Status.Replicas = 1
+			sts.Status.CurrentReplicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
+			g.Expect(th.K8sClient.Status().Update(th.Ctx, sts)).Should(Succeed())
+		}, timeout, interval).Should(Succeed())
+	}
+
+	BeforeEach(func() {
+		rabbitmqName = types.NamespacedName{
+			Name:      fmt.Sprintf("rmq-health-%d", GinkgoRandomSeed()%1000),
+			Namespace: namespace,
+		}
+	})
+
+	It("records what the brokers report about themselves", func() {
+		rabbitMQMgmt.Respond(
+			`[{"name":"rabbit@a","running":true},{"name":"rabbit@b","running":true},`+
+				`{"name":"rabbit@c","running":false}]`,
+			`[{"name":"full","vhost":"/","type":"quorum","members":["a","b","c"],"online":["a","b","c"]},`+
+				`{"name":"degraded","vhost":"/","type":"quorum","members":["a","b","c"],"online":["a","b"]},`+
+				`{"name":"plain","vhost":"/","type":"classic","node":"a","durable":true}]`)
+
+		rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+		DeferCleanup(th.DeleteInstance, rabbitmq)
+		createReadyBrokerPod(rabbitmqName.Name + "-server-0")
+		simulateSTSReady()
+
+		Eventually(func(g Gomega) {
+			health := GetRabbitMQ(rabbitmqName).Status.ClusterHealth
+			g.Expect(health).NotTo(BeNil())
+			g.Expect(health.Error).To(BeEmpty())
+			g.Expect(health.ObservedAt.IsZero()).To(BeFalse())
+			// A broker that is down still belongs to the cluster.
+			g.Expect(health.Members).To(Equal(3))
+			g.Expect(health.RunningMembers).To(Equal(2))
+			g.Expect(health.QuorumQueues).To(Equal(2))
+			g.Expect(health.UnderReplicatedQuorumQueues).To(Equal(1))
+			// Two copies out of three is still more than half.
+			g.Expect(health.QuorumQueuesBelowQuorum).To(Equal(0))
+			g.Expect(health.DegradedQueues).To(ConsistOf("//degraded"))
+		}, timeout, interval).Should(Succeed())
+	})
+
+	// Not being able to reach a broker tells you nothing about whether the spec
+	// was applied. If this read could mark the RabbitMq not ready, one failed
+	// HTTP request would spread to everything waiting on the RabbitMq.
+	It("records a failed observation without affecting readiness", func() {
+		rabbitMQMgmt.Fail(http.StatusServiceUnavailable)
+		DeferCleanup(func() { rabbitMQMgmt.Respond("[]", "[]") })
+
+		rabbitmq := CreateRabbitMQ(rabbitmqName, GetDefaultRabbitMQSpec())
+		DeferCleanup(th.DeleteInstance, rabbitmq)
+		createReadyBrokerPod(rabbitmqName.Name + "-server-0")
+		simulateSTSReady()
+
+		Eventually(func(g Gomega) {
+			instance := GetRabbitMQ(rabbitmqName)
+			g.Expect(instance.Status.ClusterHealth).NotTo(BeNil())
+			g.Expect(instance.Status.ClusterHealth.Error).To(ContainSubstring("503"))
+			g.Expect(instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)).To(BeTrue())
+			g.Expect(instance.Status.Conditions.IsFalse(condition.ReadyCondition)).To(BeFalse())
+		}, timeout, interval).Should(Succeed())
 	})
 })
